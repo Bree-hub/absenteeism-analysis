@@ -1,0 +1,15 @@
+# R / RStudio clutter
+.Rproj.user/
+.Rhistory
+.RData
+.Ruserdata
+
+# The knitted HTML stays local (GitHub can't display it; the .md version is the one in the repo)
+R/*.html
+
+# Power BI files stay local (screenshots are in images/)
+*.pbix
+
+# Windows clutter
+desktop.ini
+Thumbs.db

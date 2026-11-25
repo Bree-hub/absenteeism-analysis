@@ -1,0 +1,593 @@
+---
+title: "Absenteeism at Work — Analysis"
+subtitle: "EDA and Clustering (CRISP-DM)"
+author: "Brenda"
+date: "`r Sys.Date()`"
+output:
+  github_document:
+    toc: true
+    html_preview: false
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    theme: flatly
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, warning = FALSE, message = FALSE,
+  fig.width = 8, fig.height = 5, fig.align = "center"
+)
+```
+
+# Introduction
+
+This analysis explores the UCI **Absenteeism at Work** dataset (740 absence
+records from 36 employees at a Brazilian courier company). It follows the
+CRISP-DM process: understand the data, explore it, then cluster it to answer
+two questions — *what kinds of absences happen here?* and *what kinds of
+employees do we have?*
+
+The main finding, previewed up front: absence **duration** is driven mostly by
+the medical reason, while what separates employees is absence **frequency** —
+and higher frequency is strongly associated with social drinking.
+
+```{r packages}
+library(tidyverse)   # data wrangling + ggplot2
+library(janitor)     # clean_names()
+library(skimr)       # skim() summaries
+library(corrplot)    # correlation heatmap
+library(cluster)     # daisy() (Gower distance) + pam()
+```
+
+# Data ingestion
+
+The file is **semicolon-delimited**, so we read it with `read_delim(delim = ";")`.
+`clean_names()` then tidies the messy column names (trailing spaces, slashes)
+into snake_case.
+
+```{r ingest}
+# The path is relative to this R/ folder (knitting runs from here)
+raw <- read_delim(
+  "../data/Absenteeism_at_work.csv",
+  delim = ";",
+  show_col_types = FALSE
+)
+
+abs <- clean_names(raw)
+glimpse(abs)
+```
+
+**Output:** 740 rows, 21 columns. Note every column reads as numeric (`<dbl>`),
+even though many are really categories in disguise (reason codes, day of week,
+yes/no flags). We fix that next.
+
+# Data preparation: recode categories as factors
+
+Many columns are *labels stored as numbers* — e.g. `day_of_the_week` uses codes
+2–6 for Mon–Fri. Treating them as numbers would let R do nonsense arithmetic
+("Thursday minus Monday = 3"). Converting them to **factors** tells R they are
+categories, not quantities.
+
+```{r recode}
+abs <- abs %>%
+  mutate(
+    id = factor(id),   # an employee label, never a quantity
+
+    day_of_the_week = factor(day_of_the_week,
+                             levels = c(2, 3, 4, 5, 6),
+                             labels = c("Mon", "Tue", "Wed", "Thu", "Fri")),
+
+    seasons = factor(seasons,
+                     levels = c(1, 2, 3, 4),
+                     labels = c("Summer", "Autumn", "Winter", "Spring")),
+
+    education = factor(education,
+                       levels = c(1, 2, 3, 4),
+                       labels = c("High school", "Graduate",
+                                  "Postgraduate", "Master/Doctor")),
+
+    # Binary flags: 0/1 -> No/Yes
+    disciplinary_failure = factor(disciplinary_failure, levels = c(0, 1), labels = c("No", "Yes")),
+    social_drinker       = factor(social_drinker,       levels = c(0, 1), labels = c("No", "Yes")),
+    social_smoker        = factor(social_smoker,        levels = c(0, 1), labels = c("No", "Yes")),
+
+    # Kept as plain factor codes (no custom labels)
+    reason_for_absence = factor(reason_for_absence),
+    month_of_absence   = factor(month_of_absence)
+  )
+
+glimpse(abs)
+```
+
+Quick check that the recoding took — the factor levels and a tally of one:
+
+```{r recode-check}
+levels(abs$day_of_the_week)   # allowed categories, in order
+table(abs$day_of_the_week)    # count of absences per weekday
+```
+
+# Data understanding (EDA)
+
+## Overview summaries
+
+`summary()` and `skim()` give a first look at every column — type-appropriate
+stats for numbers, category counts for factors.
+
+```{r summaries}
+summary(abs)
+skim(abs)
+```
+
+## Data-quality checks
+
+Two hidden issues to catch before analysis.
+
+**Issue 1 — impossible months.** Month should be 1–12; a `0` bucket is a
+data-entry error.
+
+```{r quality-month}
+table(abs$month_of_absence)
+```
+
+**Issue 2 — zero-hour "absences".** These turn out to be disciplinary records
+(reason 0, disciplinary_failure = Yes), not real absences.
+
+```{r quality-zero}
+table(abs$absenteeism_time_in_hours == 0)
+
+abs %>%
+  filter(absenteeism_time_in_hours == 0) %>%
+  count(reason_for_absence, disciplinary_failure)
+```
+
+**Output:** 44 zero-hour rows, ~40 of them disciplinary. These aren't absences,
+so we drop them — a scope decision (analyse *genuine* absences), not just a
+data-quality fix.
+
+## Cleaning
+
+```{r clean}
+abs_clean <- abs %>%
+  filter(month_of_absence != 0) %>%        # drop 3 broken-month rows
+  filter(absenteeism_time_in_hours > 0)    # keep only genuine absences (>0 hrs)
+
+nrow(abs)         # 740 (original, untouched)
+nrow(abs_clean)   # 696 (the month-0 rows were a subset of the zero-hour rows)
+```
+
+**Note:** we land on 696, not 693 — the 3 month-0 rows were *already* zero-hour
+rows, so the two filters overlap completely. Bad records cluster together.
+
+# Exploring the target: absence hours
+
+The target is heavily right-skewed (a few very long absences), so we view it on
+a `log(1 + x)` scale to see the structure. `log1p` is used (not `log`) because
+it is safe at zero.
+
+```{r target-hist}
+ggplot(abs_clean, aes(x = log1p(absenteeism_time_in_hours))) +
+  geom_histogram(bins = 20, fill = "darkorange", color = "white") +
+  labs(title = "Absence hours on a log(1 + x) scale — the skew flattens out",
+       x = "log(1 + absence hours)", y = "Number of records") +
+  theme_minimal()
+
+summary(abs_clean$absenteeism_time_in_hours)
+```
+
+**Output:** median 3h, mean 7.4h. Mean far above median = strong right skew.
+The tallest spike is at 8 hours — a full workday off.
+
+# What drives absence duration?
+
+## By reason for absence
+
+```{r reason-boxplot}
+ggplot(abs_clean, aes(x = reason_for_absence, y = absenteeism_time_in_hours)) +
+  geom_boxplot(fill = "steelblue") +
+  labs(title = "Absence duration varies a lot by reason",
+       x = "Reason for absence (ICD code)", y = "Absence time (hours)") +
+  theme_minimal()
+```
+
+Reason clearly matters — but before trusting any single box, check how many
+absences sit behind it (a dramatic box built on 4 rows is noise).
+
+```{r reason-counts}
+abs_clean %>%
+  count(reason_for_absence, sort = TRUE) %>%
+  print(n = 27)
+```
+
+**Output:** routine reasons dominate (23 medical consultation = 149, 28 dental
+= 112, 27 physiotherapy = 68), while several dramatic-looking reasons have
+< 5 absences. So we re-plot using only reasons with **10+** absences, ordered
+by median duration:
+
+```{r reason-boxplot-clean}
+common_reasons <- abs_clean %>%
+  count(reason_for_absence) %>%
+  filter(n >= 10) %>%
+  pull(reason_for_absence)
+
+abs_clean %>%
+  filter(reason_for_absence %in% common_reasons) %>%
+  ggplot(aes(x = reorder(reason_for_absence, absenteeism_time_in_hours, FUN = median),
+             y = absenteeism_time_in_hours)) +
+  geom_boxplot(fill = "steelblue") +
+  coord_flip() +
+  labs(title = "Absence duration by reason (reasons with 10+ absences)",
+       subtitle = "Ordered by median; rare reasons excluded to avoid over-reading noise",
+       x = "Reason for absence (ICD code)", y = "Absence time (hours)") +
+  theme_minimal()
+```
+
+**Output:** routine care (dental, physiotherapy, consultation) → short; injury
+and musculoskeletal → longer and more variable.
+
+## Do the numeric variables relate to duration?
+
+Correlation measures straight-line association between numbers. We compute it
+between absence hours and every numeric suspect, then rank.
+
+```{r correlation}
+numeric_suspects <- abs_clean %>%
+  select(absenteeism_time_in_hours, age, service_time, work_load_average_day,
+         transportation_expense, distance_from_residence_to_work, hit_target,
+         son, pet, weight, height, body_mass_index)
+
+cor_matrix <- cor(numeric_suspects)
+
+sort(cor_matrix[, "absenteeism_time_in_hours"], decreasing = TRUE)
+```
+
+**Output:** every correlation is under 0.15 — essentially no linear relationship.
+Duration is not driven by any single number (age, distance, workload, BMI...).
+That's a real finding: the signal lives in the *categories*, not the numbers.
+
+We double-check the least-weak one (`son`) as categories, in case a curve was
+hiding that correlation missed:
+
+```{r son-boxplot}
+abs_clean %>%
+  ggplot(aes(x = factor(son), y = absenteeism_time_in_hours)) +
+  geom_boxplot(fill = "steelblue") +
+  labs(title = "Absence duration by number of children",
+       x = "Number of children", y = "Absence time (hours)") +
+  theme_minimal()
+```
+
+**Output:** flat across all groups — confirms no relationship.
+
+## Do the other categories relate to duration?
+
+We reshape to long format (`pivot_longer`) so we can facet all categorical
+suspects into one consolidated plot.
+
+```{r facet}
+abs_long <- abs_clean %>%
+  select(absenteeism_time_in_hours, day_of_the_week, seasons,
+         social_drinker, social_smoker, education) %>%
+  pivot_longer(
+    cols = c(day_of_the_week, seasons, social_drinker, social_smoker, education),
+    names_to = "variable",
+    values_to = "value"
+  )
+
+ggplot(abs_long, aes(x = value, y = absenteeism_time_in_hours)) +
+  geom_boxplot(fill = "steelblue") +
+  facet_wrap(~ variable, scales = "free_x") +
+  labs(title = "Absence duration across the categorical suspects",
+       x = NULL, y = "Absence time (hours)") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+**Output:** all five panels are flat. Day, season, education, drinker, smoker —
+none change absence *duration*. Combined with the flat correlations, this cements
+it: **duration is driven by the medical reason and little else.**
+
+# Absence frequency: a different question
+
+Duration plots are blind to *how often* someone is absent. So we aggregate to
+one row per employee and look at frequency instead.
+
+```{r freq}
+freq <- abs_clean %>%
+  group_by(id) %>%
+  summarise(n_absences = n(),
+            total_hours = sum(absenteeism_time_in_hours),
+            .groups = "drop")
+
+arrange(freq, desc(n_absences))
+
+ggplot(freq, aes(x = n_absences)) +
+  geom_histogram(binwidth = 5, fill = "steelblue", color = "white") +
+  labs(title = "Absence frequency varies widely across employees",
+       x = "Number of absences", y = "Employees") +
+  theme_minimal()
+```
+
+**Output:** very uneven — a few employees absent constantly, most rarely.
+
+Now attach fixed traits and test whether they relate to frequency.
+
+```{r freq2}
+freq2 <- abs_clean %>%
+  group_by(id) %>%
+  summarise(n_absences = n(),
+            social_drinker = first(social_drinker),
+            social_smoker  = first(social_smoker),
+            age = first(age),
+            .groups = "drop")
+
+ggplot(freq2, aes(x = social_drinker, y = n_absences)) +
+  geom_boxplot(fill = "steelblue") +
+  labs(title = "Absence frequency by drinker status",
+       x = "Social drinker", y = "Number of absences") +
+  theme_minimal()
+
+ggplot(freq2, aes(x = social_smoker, y = n_absences)) +
+  geom_boxplot(fill = "steelblue") +
+  labs(title = "Absence frequency by smoker status",
+       x = "Social smoker", y = "Number of absences") +
+  theme_minimal()
+
+ggplot(freq2, aes(x = age, y = n_absences)) +
+  geom_point(size = 3, color = "steelblue") +
+  geom_smooth(method = "lm", se = FALSE, color = "darkorange") +
+  labs(title = "Absence frequency vs age", x = "Age", y = "Number of absences") +
+  theme_minimal()
+```
+
+Always check group sizes before trusting a split:
+
+```{r freq-counts}
+freq2 %>% count(social_smoker)
+freq2 %>% count(social_drinker)
+```
+
+**Output:** drinkers (16 No / 17 Yes) are balanced — the drinker split is
+**credible**, and drinkers are absent more often. Smokers (only 7 Yes) are too
+few to trust. Age trend is weak and outlier-driven. So: **drinking relates to
+higher frequency; that's the one solid frequency lead.**
+
+# Clustering 1 — kinds of absences (absence-level)
+
+We cluster the 696 absences. Because the data is **mixed** (numbers + categories),
+k-means won't work — it can only do arithmetic on numbers. We use **Gower
+distance** (handles mixed types) fed into **PAM** (k-means's cousin that accepts
+a distance matrix).
+
+```{r clust-prep}
+clust_data <- abs_clean %>%
+  select(reason_for_absence, month_of_absence, day_of_the_week, seasons,
+         absenteeism_time_in_hours, transportation_expense,
+         distance_from_residence_to_work, age,
+         social_drinker, social_smoker, education)
+
+str(clust_data)   # confirm factors are factors, numbers are numbers
+```
+
+```{r gower}
+gower_dist <- daisy(clust_data, metric = "gower")
+summary(gower_dist)   # Gower distances fall between 0 and 1
+```
+
+## Choosing k (silhouette)
+
+Try k = 2–8; higher silhouette width = better-separated clusters.
+
+```{r sil-absence}
+sil_width <- numeric(8)
+for (k in 2:8) {
+  pam_fit <- pam(gower_dist, diss = TRUE, k = k)
+  sil_width[k] <- pam_fit$silinfo$avg.width
+}
+
+plot(2:8, sil_width[2:8], type = "b",
+     xlab = "Number of clusters (k)", ylab = "Average silhouette width",
+     main = "Higher = better-separated clusters")
+```
+
+**Output:** all scores are low (~0.14) — absences do **not** form crisp types.
+We take k = 2 (interpretable) and report the weak separation honestly.
+
+## Fit and profile (k = 2)
+
+```{r pam-absence}
+pam_fit <- pam(gower_dist, diss = TRUE, k = 2)
+
+abs_clustered <- clust_data %>%
+  mutate(cluster = as.factor(pam_fit$clustering))
+
+table(abs_clustered$cluster)   # ~351 / 345, an even split
+
+abs_clustered %>%
+  group_by(cluster) %>%
+  summarise(n = n(),
+            avg_hours    = mean(absenteeism_time_in_hours),
+            avg_age      = mean(age),
+            avg_distance = mean(distance_from_residence_to_work),
+            avg_expense  = mean(transportation_expense))
+```
+
+What defines the split — drinker and education (as proportions):
+
+```{r absence-profile}
+abs_clustered %>%
+  count(cluster, social_drinker) %>%
+  group_by(cluster) %>%
+  mutate(proportion = n / sum(n))
+
+abs_clustered %>%
+  count(cluster, education) %>%
+  group_by(cluster) %>%
+  mutate(proportion = n / sum(n))
+```
+
+**Output:** the two clusters split almost entirely on **drinker status**
+(cluster 1 ≈ 78% non-drinkers, cluster 2 ≈ 91% drinkers), with education and
+distance tracking along. These traits travel together.
+
+## Sanity check — do clusters map to employees?
+
+Since 696 absences come from 33 people, the split may really be a *people* split.
+
+```{r absence-sanity}
+check <- abs_clean %>%
+  mutate(cluster = as.factor(pam_fit$clustering))
+
+check %>%
+  group_by(id) %>%
+  summarise(n_absences = n(),
+            pct_cluster1 = mean(cluster == 1),   # 1 = all in cluster 1, 0 = all in cluster 2
+            .groups = "drop") %>%
+  arrange(desc(n_absences))
+```
+
+**Output:** mostly (not purely) about people — the highest-volume employees sit
+almost entirely in one cluster, but a few employees split across both. So the
+clusters are largely an employee split, with some genuine absence-level variation.
+
+# Clustering 2 — kinds of employees (employee-level)
+
+Absence-level clustering is blind to *frequency*. Aggregating to 33 employees
+lets us cluster on frequency + severity, which surfaces a segmentation the
+absence-level model couldn't.
+
+```{r emp-build}
+emp_data <- abs_clean %>%
+  group_by(id) %>%
+  summarise(
+    n_absences  = n(),                              # FREQUENCY
+    avg_hours   = mean(absenteeism_time_in_hours),  # SEVERITY
+    total_hours = sum(absenteeism_time_in_hours),   # total burden
+    age         = first(age),
+    distance    = first(distance_from_residence_to_work),
+    drinker     = first(social_drinker),
+    smoker      = first(social_smoker),
+    education   = first(education),
+    .groups = "drop"
+  )
+
+emp_data
+```
+
+```{r emp-gower}
+emp_features <- emp_data %>% select(-id)   # drop id for the distance calc
+gower_emp <- daisy(emp_features, metric = "gower")
+
+sil_emp <- numeric(8)
+for (k in 2:8) {
+  pam_k <- pam(gower_emp, diss = TRUE, k = k)
+  sil_emp[k] <- pam_k$silinfo$avg.width
+}
+plot(2:8, sil_emp[2:8], type = "b",
+     xlab = "k", ylab = "Avg silhouette width",
+     main = "Employee clustering: how many segments?")
+```
+
+**Output:** silhouette ~0.33 — **much** cleaner than the absence-level 0.14.
+Fewer, cleaner rows separate better than many noisy ones. We choose k = 3
+(near the peak, and interpretable).
+
+## Fit and profile (k = 3)
+
+```{r emp-pam}
+pam_emp <- pam(gower_emp, diss = TRUE, k = 3)
+
+emp_data <- emp_data %>%
+  mutate(segment = as.factor(pam_emp$clustering))
+
+emp_data %>%
+  group_by(segment) %>%
+  summarise(
+    n_employees    = n(),
+    avg_n_absences = mean(n_absences),   # frequency
+    avg_hours_each = mean(avg_hours),    # severity
+    avg_total_hrs  = mean(total_hours),  # total burden
+    avg_age        = mean(age),
+    avg_distance   = mean(distance)
+  )
+
+emp_data %>%
+  group_by(segment) %>%
+  summarise(n = n(),
+            pct_drinker  = mean(drinker == "Yes"),
+            pct_smoker   = mean(smoker == "Yes"),
+            avg_distance = mean(distance))
+```
+
+**Output:** three segments form a **frequency ladder** — low (~4 absences),
+moderate (~20), high (~29) — while typical absence length stays ~8h across all
+three. So employees differ by *how often*, not *how long*. And the traits track
+perfectly: the high-frequency segment is 100% drinkers, the moderate segment 0%.
+The drinker signal appears a third time (after the frequency boxplots and the
+absence-level clustering) — strong corroboration in a 33-person sample.
+```{r}
+abs_clustered <- abs_clean %>%
+  mutate(
+    cluster = as.factor(pam_fit$clustering),
+    cluster_name = case_when(
+      cluster == 1 ~ "Profile A",
+      cluster == 2 ~ "Profile B"
+    ))
+```
+
+
+```{r}
+emp_data <- emp_data %>%
+  mutate(
+    segment_name = case_when(
+      segment == 1 ~ "Moderate",
+      segment == 2 ~ "Low absence",
+      segment == 3 ~ "High burden"
+    ))
+```
+
+
+```{r}
+abs <- abs %>%
+  mutate(
+    reason_label = case_when(
+      reason_for_absence == 23 ~ "Medical consultation",
+      reason_for_absence == 28 ~ "Dental consultation",
+      reason_for_absence == 27 ~ "Physiotherapy",
+      reason_for_absence == 13 ~ "Musculoskeletal",
+      reason_for_absence == 19 ~ "Injury / poisoning",
+      reason_for_absence == 22 ~ "Follow-up medical",
+      reason_for_absence == 26 ~ "Unjustified absence",
+      reason_for_absence == 25 ~ "Lab exam / referral",
+      reason_for_absence == 11 ~ "Digestive system",
+      reason_for_absence == 10 ~ "Respiratory system",
+      TRUE ~ "Other"    # everything not listed above
+    )
+  )
+```
+
+# Save outputs for Power BI
+
+```{r save}
+dir.create("../output", showWarnings = FALSE)   # make the folder if it isn't there yet
+
+write_csv(abs,            "../output/absenteeism_full_labelled.csv")   # 740 rows, all labelled — for the EDA page
+write_csv(abs_clustered,  "../output/absenteeism_clustered.csv")       # now WITH id + cluster_name
+write_csv(emp_data,       "../output/employee_segments.csv")           # now WITH segment_name
+```
+
+# Findings summary
+
+- **Duration** is driven mainly by the **medical reason**; numeric variables and
+  most categories are flat.
+- **Frequency** is where employees differ — a small reliable group, a moderate
+  group, and a high-burden group that drives most lost time.
+- Higher frequency is **strongly associated with social drinking** (seen three
+  independent ways). Association only — small, entangled sample; not causation.
+- **Absence-level clusters** are weak (they don't form crisp types);
+  **employee-level segments** are much cleaner and more actionable.
+
+*Caveat throughout: 740 absences come from just 33 employees, so person-level
+findings rest on a small sample — clear tendencies, not population law.*
